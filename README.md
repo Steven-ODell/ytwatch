@@ -4,7 +4,7 @@ Lets Claude Code "watch" a YouTube video. Give it a link and it saves:
 
 - `info.txt`: title, channel, length, chapters, description
 - `transcript.txt`: timestamped transcript from YouTube's captions, or a local
-  whisper transcription when there are none
+  whisper transcription when there are none or YouTube refuses them (429)
 - `screen.txt`: code and slide text read off the screen with OCR
 - `frames/` and `sheets/`: 720p frames picked at scene cuts, plus labeled 3x3
   contact sheets Claude can look at
@@ -73,8 +73,11 @@ ytwatch.py URL --whisper               ignore captions, transcribe locally
 ytwatch.py clean                       delete the cache
 ```
 
-Whisper runs on the CPU, about real time, and downloads its model (~500 MB)
-the first time. Videos with captions skip it.
+Whisper runs `small.en` on the CPU, several times faster than real time
+(about 7x on a desktop CPU), and downloads its model (~500 MB) the first
+time. On Linux with an NVIDIA GPU it runs `large-v3-turbo` on the GPU
+instead, about 65x real time, after a one-time 2.2 GB CUDA library
+download. Videos with captions skip it.
 
 ## When downloads start failing
 

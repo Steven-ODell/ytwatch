@@ -2,8 +2,8 @@
 name: youtube
 description: >-
   Watch a YouTube video with ytwatch.py: it saves the video's info, a
-  timestamped transcript (YouTube captions, or local whisper when there are
-  none), the text OCR'd off the screen (code, slides), 720p frames and
+  timestamped transcript (YouTube captions, or local whisper when they are
+  missing or blocked), the text OCR'd off the screen (code, slides), 720p frames and
   labeled 3x3 contact sheets you can Read as images. Use whenever the user
   shares a YouTube link or asks what a video says, shows, or how to do what
   a video does. Triggers: "youtube.com", "youtu.be", "watch this video",
@@ -60,10 +60,16 @@ ffmpeg; later runs start right away.
 - A sheet costs about 1.4k image tokens, a 720p frame about 1.2k. screen.txt
   for a code-heavy video is usually under 1k tokens. Don't read sheets
   or frames you don't need.
-- Whisper runs on the CPU, roughly real time for `small.en` on a laptop, so
-  a 30 min video without captions can take 30 min. Say so before starting
-  one and prefer `--from/--to`. Non-English audio: `--model small`. The
-  first whisper run downloads the model (~500 MB).
+- Captions: auto captions come from the `en-orig` track. If YouTube still
+  refuses them (HTTP 429), ytwatch says "captions blocked (429), falling
+  back to whisper" and transcribes the audio itself. If the audio download
+  is blocked too, that needs cookies or a VPN, not a whisper fix.
+- On Windows whisper runs `small.en` on the CPU: about 7x real time on a
+  desktop CPU (a 30 min video in ~5 min), slower on a laptop. Say so before
+  a long one and prefer `--from/--to`. Non-English audio: `--model small`.
+  The first whisper run downloads the model (~500 MB). On Linux with an
+  NVIDIA GPU it uses `large-v3-turbo` on the GPU instead (~65x real time,
+  plus a one-time 2.2 GB CUDA library download).
 - Video and audio downloads go to a temp dir and are deleted. Only the text
   and JPGs stay in the cache (a few MB per video).
 - Age-restricted, members-only and live videos fail at the info step.

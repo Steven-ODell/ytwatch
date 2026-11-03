@@ -16,6 +16,7 @@
   ytwatch URL --from 5:00 --to 9:30   only that stretch (transcript and frames)
   ytwatch URL --at 6:12,7:40     sharp 720p stills at those moments
   ytwatch URL --whisper          ignore YouTube captions, transcribe locally
+  ytwatch URL --tempo 2          whisper hears the audio at 2x (GPU default 1.5)
   ytwatch URL --no-frames        transcript only (no video download)
   ytwatch URL --no-ocr           frames from 360p video, no screen.txt
   ytwatch clean                  delete the cache
@@ -32,11 +33,19 @@ Frames are taken at scene cuts plus one every span/--frames seconds, then
 near-duplicates are dropped, so a talking head shrinks to a few frames and
 every slide or code change gets one.
 
-Captions come from YouTube (manual first, then auto, as json3). With none,
-or with --whisper, the audio is transcribed by faster-whisper on the CPU
-(small.en, shared with scribe's model cache), primed with the title,
-chapters and description so names come out right. The model dies with the
-process. The video used for frames is deleted after they are cut.
+Captions come from YouTube (manual first, then auto, as json3; for auto
+captions the en-orig track, since YouTube rate limits the translated "en"
+one). With none, when YouTube refuses them (429), or with --whisper, the
+audio is transcribed by faster-whisper instead: large-v3-turbo in float16
+on an NVIDIA GPU (~65x real time at 1.5x, half a minute for a half-hour
+video), small.en on the CPU otherwise (~7x real time). Models are shared
+with scribe's cache. The first GPU run on a Linux machine fetches CUDA 12
+cuBLAS + cuDNN 9 (2.2 GB) into ~/.cache/ytwatch-cuda. On the GPU the audio
+is sped up 1.5x (--tempo); on the CPU that saves nothing, so it stays 1x.
+Silence is skipped by whisper's VAD and times are mapped back to the
+video. The prompt is the title, chapters and description so names come
+out right. The model dies with the process. The video used for frames is
+deleted after they are cut.
 
 Windows: install uv, then `uv run --script ytwatch.py URL`. yt-dlp, deno and
 ffmpeg come from PyPI; tesseract is optional (winget install
@@ -59,6 +68,9 @@ from pathlib import Path
 
 CACHE = Path("~/.cache/ytwatch").expanduser()
 WHISPER_DIR = Path("~/.cache/scribe/whisper").expanduser()
+# CUDA 12 cuBLAS + cuDNN 9 wheels for ctranslate2 (Arch ships CUDA 13).
+# Outside CACHE so `ytwatch clean` doesn't throw away 1.3 GB.
+CUDA_LIBS = Path("~/.cache/ytwatch-cuda").expanduser()
 SCENE = 0.25  # ffmpeg scene score that counts as a cut
 SAME = 20     # dHash bits (of 256) under which two frames are the same picture
 ONE_SCENE = 0.9  # colour-histogram overlap above which frames share a scene
@@ -138,10 +150,13 @@ def write_info(info, path):
 # ---------- captions ----------
 
 def pick_caption_lang(info):
-    """Prefer human captions, then YouTube's auto ones. English first."""
+    """Prefer human captions, then YouTube's auto ones. English first.
+    Auto "en" is YouTube's translation of the track (and gets 429'd);
+    "en-orig" is the speech-recognized original, so it goes first."""
     for key in ("subtitles", "automatic_captions"):
         tracks = info.get(key) or {}
-        for want in ("en", "en-US", "en-GB", "en-orig"):
+        wants = ("en", "en-US", "en-GB") if key == "subtitles" else ("en-orig", "en", "en-US", "en-GB")
+        for want in wants:
             if want in tracks:
                 return key, want
         for lang in tracks:
@@ -153,16 +168,25 @@ def pick_caption_lang(info):
 def fetch_captions(url, info, work):
     key, lang = pick_caption_lang(info)
     if not key:
+        say("no captions, falling back to whisper")
         return None, None
     flag = "--write-subs" if key == "subtitles" else "--write-auto-subs"
-    run([*YTDLP, "--skip-download", "--no-playlist", "--no-warnings", "-q",
-         flag, "--sub-langs", lang, "--sub-format", "json3/vtt",
-         "-o", str(work / "subs"), url])
+    try:
+        run([*YTDLP, "--skip-download", "--no-playlist", "--no-warnings", "-q",
+             flag, "--sub-langs", lang, "--sub-format", "json3/vtt",
+             "-o", str(work / "subs"), url],
+            capture_output=True, encoding="utf-8", errors="replace")
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or "").strip()
+        why = "429" if "429" in err else (err.splitlines() or [f"exit {e.returncode}"])[-1]
+        say(f"captions blocked ({why}), falling back to whisper")
+        return None, None
     kind = "manual captions" if key == "subtitles" else "auto captions"
     if sub := next(work.glob("subs*.json3"), None):
         return parse_json3(sub.read_text(encoding="utf-8", errors="replace")), f"{kind} ({lang})"
     if sub := next(work.glob("subs*.vtt"), None):
         return parse_vtt(sub.read_text(encoding="utf-8", errors="replace")), f"{kind} ({lang}, vtt)"
+    say("no captions, falling back to whisper")
     return None, None
 
 
@@ -214,27 +238,99 @@ def whisper_prompt(info):
     return ". ".join(p for p in parts if p)[-700:]
 
 
-def transcribe(url, info, work, model_name, start, end):
-    say("downloading audio")
-    cmd = [*YTDLP, "-f", "bestaudio/best", "--no-playlist", "--no-warnings", "-q",
-           "-o", str(work / "audio.%(ext)s"), url]
-    if start is not None or end is not None:
-        cmd[len(YTDLP):len(YTDLP)] = ["--download-sections", f"*{start or 0}-{end if end is not None else 'inf'}"]
-    run(cmd)
-    audio = next(work.glob("audio.*"))
-    say(f"transcribing with whisper {model_name} (CPU)")
+def cuda_ready():
+    """True when whisper can run on an NVIDIA GPU. ctranslate2 is built for
+    CUDA 12 cuBLAS and cuDNN 9; those come as pip wheels, fetched once into
+    CUDA_LIBS and preloaded so its dlopen finds them. Linux only."""
+    if sys.platform != "linux" or not shutil.which("nvidia-smi"):
+        return False
+    import ctranslate2
+    if ctranslate2.get_cuda_device_count() == 0:
+        return False
+
+    def find():
+        return sorted([*CUDA_LIBS.glob("nvidia/cublas/lib/libcublas*.so.12"),
+                       *CUDA_LIBS.glob("nvidia/cudnn/lib/libcudnn*.so.9")])
+    if not find():
+        say(f"fetching CUDA 12 cuBLAS + cuDNN 9 for the GPU (2.2 GB, once) into {CUDA_LIBS}")
+        try:
+            run(["uv", "pip", "install", "--quiet", "--target", str(CUDA_LIBS),
+                 "--python", sys.executable, "nvidia-cublas-cu12", "nvidia-cudnn-cu12>=9,<10"])
+        except (OSError, subprocess.CalledProcessError):
+            return False
+    # Load order matters (cublas needs cublasLt, cudnn parts need each
+    # other): retry the failures until a pass loads nothing new.
+    import ctypes
+    pending = find()
+    while pending:
+        failed = []
+        for lib in pending:
+            try:
+                ctypes.CDLL(str(lib), mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                failed.append(lib)
+        if len(failed) == len(pending):
+            break
+        pending = failed
+    loaded = {p.name for p in find()} - {p.name for p in pending}
+    return {"libcublas.so.12", "libcublasLt.so.12", "libcudnn.so.9"} <= loaded
+
+
+def transcribe(url, info, work, model_name, start, end, tempo):
+    """Returns ([(start_sec, text)], label). The audio is played to whisper
+    at `tempo` x; whisper's VAD skips the silences and gives times in the
+    sped-up audio, so original time = start + t * tempo. tempo None = 1.5
+    on the GPU (about 20% faster, same words) and 1 on the CPU, where
+    speeding up saved no time and 2x cost accuracy."""
     from faster_whisper import WhisperModel
-    model = WhisperModel(model_name, device="cpu", compute_type="int8",
-                         cpu_threads=os.cpu_count() or 4,
-                         download_root=str(WHISPER_DIR))
+    devices = [("cuda", "float16"), ("cpu", "int8")] if cuda_ready() else [("cpu", "int8")]
+    if tempo is None:
+        tempo = 1.5 if devices[0][0] == "cuda" else 1
+    say("downloading audio")
+    # The whole track, cut by ffmpeg below: --download-sections is slower
+    # for audio and starts up to ~10 s early, which shifts every timestamp.
+    run([*YTDLP, "-f", "bestaudio/best", "--no-playlist", "--no-warnings", "-q",
+         "-o", str(work / "audio.%(ext)s"), url])
+    audio = next(work.glob("audio.*"))
     # Decode with ffmpeg, not PyAV: faster-whisper's av call breaks on new av.
     import numpy as np
-    pcm = run([FFMPEG, "-v", "error", "-i", str(audio), "-f", "f32le", "-ac", "1",
-               "-ar", "16000", "-"], capture_output=True).stdout
-    segs, _ = model.transcribe(np.frombuffer(pcm, np.float32), vad_filter=True,
-                               initial_prompt=whisper_prompt(info))
+    cut = (["-ss", str(start)] if start is not None else []) + (["-to", str(end)] if end is not None else [])
+    speed = ["-af", f"atempo={tempo}"] if tempo != 1 else []
+    pcm = run([FFMPEG, "-v", "error", *cut, "-i", str(audio), *speed, "-f", "f32le",
+               "-ac", "1", "-ar", "16000", "-"], capture_output=True).stdout
+    pcm = np.frombuffer(pcm, np.float32)
+
+    for device, compute in devices:
+        name = model_name or ("large-v3-turbo" if device == "cuda" else "small.en")
+        say(f"transcribing with whisper {name} ({device.upper()}, {tempo}x)")
+        try:
+            model = WhisperModel(name, device=device, compute_type=compute,
+                                 cpu_threads=os.cpu_count() or 4,
+                                 download_root=str(WHISPER_DIR))
+            segs, _ = model.transcribe(pcm, vad_filter=True, word_timestamps=True,
+                                       initial_prompt=whisper_prompt(info))
+            words = [w for seg in segs for w in seg.words]
+            break
+        except RuntimeError as e:  # CUDA out of memory, missing kernel, ...
+            if device == "cpu":
+                raise
+            say(f"GPU failed ({str(e).splitlines()[0]}), using the CPU")
+    # turbo makes one segment per 30 s window, so lines are rebuilt from
+    # word times: a new line after a sentence end or a 1 s pause.
     offset = start or 0
-    return [(offset + s.start, s.text.strip()) for s in segs if s.text.strip()]
+    lines, cur, last = [], [], 0
+    for w in words:
+        if cur and (w.start - last > 1 or cur[-1].endswith((".", "?", "!"))):
+            lines.append((t0, " ".join(cur)))
+            cur = []
+        if not cur:
+            t0 = offset + w.start * tempo
+        if w.word.strip():
+            cur.append(w.word.strip())
+        last = w.end
+    if cur:
+        lines.append((t0, " ".join(cur)))
+    return lines, f"whisper {name}, {device.upper()}, {tempo}x"
 
 
 def write_transcript(lines, path, start, end, para=30):
@@ -498,7 +594,8 @@ def main():
     ap.add_argument("--no-frames", action="store_true", help="skip the video download")
     ap.add_argument("--no-ocr", action="store_true", help="360p frames, no screen.txt")
     ap.add_argument("--whisper", action="store_true", help="transcribe locally even if captions exist")
-    ap.add_argument("--model", default="small.en", help="whisper model (default small.en; 'small' for other languages)")
+    ap.add_argument("--model", help="whisper model (default large-v3-turbo on an NVIDIA GPU, small.en on the CPU; 'small' for other languages)")
+    ap.add_argument("--tempo", type=float, help="speed the audio up this much for whisper (default 1.5 on an NVIDIA GPU, 1 = off on the CPU)")
     args = ap.parse_args()
 
     start = parse_time(args.start) if args.start else None
@@ -527,10 +624,7 @@ def main():
 
         lines, source = (None, None) if args.whisper else fetch_captions(args.url, info, work)
         if not lines:
-            if not args.whisper:
-                say("no captions, falling back to whisper")
-            lines = transcribe(args.url, info, work, args.model, start, end)
-            source = f"whisper {args.model}"
+            lines, source = transcribe(args.url, info, work, args.model, start, end, args.tempo)
         words = write_transcript(lines, out / "transcript.txt", start, end)
 
         sheets = []
