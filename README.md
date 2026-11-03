@@ -1,16 +1,26 @@
 # ytwatch
 
-Lets Claude Code "watch" a YouTube video. Give it a link and it saves:
+Lets Claude Code "watch" a video: a YouTube link, a TikTok, Instagram, X or
+Vimeo link (anything yt-dlp reads), or a video file on your computer. It saves:
 
 - `info.txt`: title, channel, length, chapters, description
-- `transcript.txt`: timestamped transcript from YouTube's captions, or a local
-  whisper transcription when there are none or YouTube refuses them (429)
+- `transcript.txt`: timestamped transcript from the site's captions, or a
+  local whisper transcription when there are none (local files always use
+  whisper)
 - `screen.txt`: code and slide text read off the screen with OCR
-- `frames/` and `sheets/`: 720p frames picked at scene cuts, plus labeled 3x3
+- `frames/` and `sheets/`: frames picked at scene cuts, plus labeled
   contact sheets Claude can look at
 
-It ships as a Claude Code skill. Once it's installed, paste a YouTube link
-into Claude Code and it runs on its own.
+Screen recordings get a more detailed mode: a frame at every visible change
+(one edited line or a toggle counts), frames at full size so small text
+reads, and `timeline.txt`, which lists what appeared and went away on screen
+at each moment along with what was said. Claude reads that first and only
+opens the frames that matter. Files named like a screen recording
+("Screen Recording ...", Windows' Snipping Tool names included) get it on
+their own; add `--screen` for anything else.
+
+It ships as a Claude Code skill. Once it's installed, paste a video link or
+a file path into Claude Code and it runs on its own.
 
 ## Install on Windows (PowerShell)
 
@@ -48,7 +58,8 @@ into Claude Code and it runs on its own.
 
    It prints where it saved things (under `%USERPROFILE%\.cache\ytwatch`).
 
-Then restart Claude Code and paste it a YouTube link.
+Then restart Claude Code and paste it a video link, or the path of a video
+file.
 
 ## Install on Linux or macOS
 
@@ -65,6 +76,9 @@ uv run --script ~/.claude/skills/youtube/ytwatch.py "https://www.youtube.com/wat
 
 ```
 ytwatch.py URL                         info + transcript + screen text + frames
+ytwatch.py C:\path\to\clip.mp4         a local video, no network
+ytwatch.py FILE --screen               screen-recording mode + timeline.txt
+ytwatch.py FILE --video                normal mode for a file named like a screen recording
 ytwatch.py URL --from 5:00 --to 9:30   only that stretch, denser frames
 ytwatch.py URL --at 6:12,7:40          sharp 720p stills of exact moments
 ytwatch.py URL --no-frames             transcript only, fastest
@@ -73,15 +87,20 @@ ytwatch.py URL --whisper               ignore captions, transcribe locally
 ytwatch.py clean                       delete the cache
 ```
 
+Local files and screen recordings work the same on Windows as on Linux. A
+recording with no sound is fine; it says "no audio, no transcript" and
+carries on.
+
 Whisper runs `small.en` on the CPU, several times faster than real time
 (about 7x on a desktop CPU), and downloads its model (~500 MB) the first
 time. On Linux with an NVIDIA GPU it runs `large-v3-turbo` on the GPU
 instead, about 65x real time, after a one-time 2.2 GB CUDA library
-download. Videos with captions skip it.
+download. Videos with captions skip it; local files always use it when they
+have sound.
 
 ## When downloads start failing
 
-YouTube changes things and yt-dlp catches up within days. On Windows, update
+Sites change things and yt-dlp catches up within days. On Windows, update
 it with one run like this:
 
 ```powershell
